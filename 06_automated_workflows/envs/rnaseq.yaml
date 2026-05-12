@@ -1,0 +1,45 @@
+name: rnaseq
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # QC
+  - fastqc=0.12.1
+  - multiqc=1.20
+  # Trimming
+  - trim-galore=0.6.10
+  - cutadapt=4.6
+  # Alignment
+  - star=2.7.11a
+  - hisat2=2.2.1
+  - bowtie2=2.5.3
+  # BAM processing
+  - samtools=1.19
+  - picard=3.1.1
+  # Quantification
+  - subread=2.0.6          # featureCounts
+  - htseq=2.0.4
+  # Coverage
+  - deeptools=3.5.4
+  - bedtools=2.31.1
+  # Variant calling
+  - gatk4=4.4.0.0
+  # Workflow
+  - snakemake=7.32.4
+  - nextflow=23.10.1
+  # Python scientific
+  - python=3.11
+  - numpy=1.26
+  - pandas=2.1
+  - scipy=1.11
+  - matplotlib=3.8
+  - seaborn=0.13
+  # Bioinformatics Python
+  - pysam=0.22
+  - biopython=1.82
+  - pip:
+      - pydeseq2==0.4.11
+      - gseapy==1.1.2
+      - scanpy==1.9.8
+      - anndata==0.10.5

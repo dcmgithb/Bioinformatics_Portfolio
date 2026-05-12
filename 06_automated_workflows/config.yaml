@@ -1,0 +1,60 @@
+# ── Snakemake RNA-seq Pipeline Configuration ──────────────────────────────────
+# Copy and modify for your experiment
+
+# Samples (list of sample IDs, matching FASTQ file basenames)
+samples:
+  - young_d1
+  - young_d2
+  - young_d3
+  - young_d4
+  - aged_d1
+  - aged_d2
+  - aged_d3
+  - aged_d4
+
+# Input reads directory
+reads_dir: "data/raw_reads"
+
+# Paired-end sequencing?
+paired_end: true
+
+# Reference genome paths (hg38)
+genome_dir:   "references/hg38_star_index"
+genome_fasta: "references/hg38.fa"
+gtf:          "references/gencode.v44.annotation.gtf"
+
+# Results output directory
+results_dir: "pipeline_output"
+
+# Thread allocation per rule
+threads_trim: 4
+threads_star: 8
+threads_fc:   4
+
+# Tool-specific arguments
+trim_galore_args: >
+  --quality 20
+  --length 36
+  --stringency 3
+
+star_args: >
+  --outSAMtype BAM SortedByCoordinate
+  --outSAMattributes NH HI AS NM MD
+  --quantMode TranscriptomeSAM
+  --twopassMode Basic
+  --outFilterMultimapNmax 20
+  --alignSJoverhangMin 8
+  --alignMatesGapMax 1000000
+  --alignIntronMax 1000000
+  --chimSegmentMin 20
+  --outSAMstrandField intronMotif
+
+featurecounts_args: >
+  -t exon
+  -g gene_id
+  -M
+  --primary
+  --ignoreDup
+
+# Strandedness: 0=unstranded, 1=sense, 2=antisense
+strandedness: 2

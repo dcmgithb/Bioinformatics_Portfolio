@@ -1,0 +1,14 @@
+# Data Quality Monitor — cron scheduling examples
+# Edit your crontab with: crontab -e
+#
+# Requires DATABASE_URL set in /app/data-quality-monitor/.env
+# Logs are appended to /var/log/dqm.log
+
+# Daily at 06:00 — full check across all categories
+0 6 * * * cd /app/data-quality-monitor && python run_monitor.py --checks all >> /var/log/dqm.log 2>&1
+
+# Weekly full report on Sunday at 07:00 — save report to /reports directory
+0 7 * * 0 cd /app/data-quality-monitor && python run_monitor.py --checks all --output-dir /reports >> /var/log/dqm.log 2>&1
+
+# Sequence-only check every 4 hours during working hours (Mon–Fri, 09:00 / 13:00 / 17:00)
+0 9,13,17 * * 1-5 cd /app/data-quality-monitor && python run_monitor.py --checks sequence --no-save

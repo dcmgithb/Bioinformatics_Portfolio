@@ -1,0 +1,274 @@
+################################################################################
+# RNA-seq Automated Workflow — Snakemake
+# Pipeline: FastQC → Trim Galore → STAR → featureCounts → MultiQC
+#
+# Usage:
+#   snakemake --cores 8 --use-conda           # local
+#   snakemake --cluster "sbatch" --jobs 50    # SLURM HPC
+#   snakemake --dryrun --printshellcmds       # dry run
+################################################################################
+
+import os
+import glob
+from pathlib import Path
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+configfile: "config.yaml"
+
+SAMPLES     = config["samples"]
+GENOME_DIR  = config["genome_dir"]
+GENOME_FASTA= config["genome_fasta"]
+GTF         = config["gtf"]
+RESULTS     = config["results_dir"]
+READS_DIR   = config["reads_dir"]
+PAIRED      = config.get("paired_end", True)
+
+THREADS_TRIM = config.get("threads_trim", 4)
+THREADS_STAR = config.get("threads_star", 8)
+THREADS_FC   = config.get("threads_fc",   4)
+
+# ── Helper Functions ───────────────────────────────────────────────────────────
+
+def get_raw_reads(wildcards):
+    """Return R1 (and R2 if paired-end) for a given sample."""
+    if PAIRED:
+        return {
+            "r1": f"{READS_DIR}/{wildcards.sample}_R1.fastq.gz",
+            "r2": f"{READS_DIR}/{wildcards.sample}_R2.fastq.gz",
+        }
+    return {"r1": f"{READS_DIR}/{wildcards.sample}.fastq.gz"}
+
+# ── Target Rule ────────────────────────────────────────────────────────────────
+
+rule all:
+    """Define final outputs — Snakemake works backwards from here."""
+    input:
+        expand(f"{RESULTS}/fastqc/{{sample}}_R1_fastqc.html",    sample=SAMPLES),
+        expand(f"{RESULTS}/fastqc/{{sample}}_R2_fastqc.html",    sample=SAMPLES) if PAIRED else [],
+        expand(f"{RESULTS}/trimmed/{{sample}}_R1_val_1.fq.gz", sample=SAMPLES),
+        expand(f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam", sample=SAMPLES),
+        expand(f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam.bai", sample=SAMPLES),
+        f"{RESULTS}/counts/all_samples_counts.txt",
+        f"{RESULTS}/multiqc/multiqc_report.html",
+        f"{RESULTS}/counts/count_matrix.csv",
+
+
+# ── Step 1: FastQC ─────────────────────────────────────────────────────────────
+
+rule fastqc_raw:
+    """Quality assessment of raw reads."""
+    input:
+        unpack(get_raw_reads)
+    output:
+        html_r1 = f"{RESULTS}/fastqc/{{sample}}_R1_fastqc.html",
+        zip_r1  = f"{RESULTS}/fastqc/{{sample}}_R1_fastqc.zip",
+        html_r2 = f"{RESULTS}/fastqc/{{sample}}_R2_fastqc.html" if PAIRED else [],
+        zip_r2  = f"{RESULTS}/fastqc/{{sample}}_R2_fastqc.zip"  if PAIRED else [],
+    params:
+        outdir = f"{RESULTS}/fastqc",
+        r2     = lambda wc, input: input.r2 if PAIRED else ""
+    threads: 2
+    conda:   "envs/rnaseq.yaml"
+    log:     f"logs/fastqc/{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        fastqc --threads {threads} --outdir {params.outdir} \
+               {input.r1} {params.r2} \
+               &> {log}
+        """
+
+
+# ── Step 2: Trim Galore ────────────────────────────────────────────────────────
+
+rule trim_galore:
+    """Adapter trimming and quality filtering with Trim Galore (Cutadapt)."""
+    input:
+        unpack(get_raw_reads)
+    output:
+        # Paired-end: Trim Galore names outputs _val_1.fq.gz / _val_2.fq.gz
+        r1    = f"{RESULTS}/trimmed/{{sample}}_R1_val_1.fq.gz",
+        r2    = f"{RESULTS}/trimmed/{{sample}}_R2_val_2.fq.gz" if PAIRED else [],
+        qc_r1 = f"{RESULTS}/trimmed/{{sample}}_R1.fastq.gz_trimming_report.txt",
+        qc_r2 = f"{RESULTS}/trimmed/{{sample}}_R2.fastq.gz_trimming_report.txt" if PAIRED else [],
+    params:
+        outdir = f"{RESULTS}/trimmed",
+        extra  = config.get("trim_galore_args", "--quality 20 --length 36"),
+        paired = "--paired" if PAIRED else "",
+        r2     = lambda wc, input: input.r2 if PAIRED else ""
+    threads: THREADS_TRIM
+    conda:   "envs/rnaseq.yaml"
+    log:     f"logs/trim_galore/{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        trim_galore \
+            {params.paired} \
+            --cores {threads} \
+            --gzip \
+            --output_dir {params.outdir} \
+            {params.extra} \
+            {input.r1} {params.r2} \
+            &> {log}
+        """
+
+
+# ── Step 3: STAR Genome Index ──────────────────────────────────────────────────
+
+rule star_index:
+    """Build STAR genome index (run once per genome version)."""
+    input:
+        fasta = GENOME_FASTA,
+        gtf   = GTF,
+    output:
+        directory(GENOME_DIR)
+    threads: 16
+    conda:   "envs/rnaseq.yaml"
+    log:     "logs/star/genome_index.log"
+    shell:
+        """
+        mkdir -p {output}
+        STAR \
+            --runMode genomeGenerate \
+            --runThreadN {threads} \
+            --genomeDir {output} \
+            --genomeFastaFiles {input.fasta} \
+            --sjdbGTFfile {input.gtf} \
+            --genomeSAindexNbases 14 \
+            &> {log}
+        """
+
+
+# ── Step 4: STAR Alignment ────────────────────────────────────────────────────
+
+rule star_align:
+    """Align trimmed reads to reference genome with STAR (2-pass mode)."""
+    input:
+        r1       = f"{RESULTS}/trimmed/{{sample}}_R1_val_1.fq.gz",
+        r2       = f"{RESULTS}/trimmed/{{sample}}_R2_val_2.fq.gz" if PAIRED else [],
+        genome   = GENOME_DIR,
+    output:
+        bam      = f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam",
+        log_final= f"{RESULTS}/star/{{sample}}/Log.final.out",
+        sj       = f"{RESULTS}/star/{{sample}}/SJ.out.tab",
+    params:
+        outdir   = f"{RESULTS}/star/{{sample}}/",
+        extra    = config.get("star_args",
+                   "--outSAMtype BAM SortedByCoordinate "
+                   "--outSAMattributes NH HI AS NM MD "
+                   "--quantMode TranscriptomeSAM "
+                   "--twopassMode Basic "
+                   "--outFilterMultimapNmax 20 "
+                   "--alignSJoverhangMin 8 "
+                   "--alignMatesGapMax 1000000 "
+                   "--alignIntronMax 1000000"),
+        r2       = lambda wc, input: input.r2 if PAIRED else ""
+    threads: THREADS_STAR
+    conda:   "envs/rnaseq.yaml"
+    log:     f"logs/star/{{sample}}.log"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        STAR \
+            --runThreadN {threads} \
+            --genomeDir {input.genome} \
+            --readFilesIn {input.r1} {params.r2} \
+            --readFilesCommand zcat \
+            --outFileNamePrefix {params.outdir} \
+            {params.extra} \
+            &> {log}
+        """
+
+
+# ── Step 5: BAM Indexing ──────────────────────────────────────────────────────
+
+rule samtools_index:
+    """Index sorted BAM files for downstream tools."""
+    input:  f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam"
+    output: f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam.bai"
+    threads: 2
+    conda:  "envs/rnaseq.yaml"
+    shell:  "samtools index -@ {threads} {input}"
+
+
+# ── Step 6: featureCounts ─────────────────────────────────────────────────────
+
+rule featurecounts:
+    """Count reads per gene across all samples simultaneously."""
+    input:
+        bams = expand(
+            f"{RESULTS}/star/{{sample}}/Aligned.sortedByCoord.out.bam",
+            sample=SAMPLES
+        ),
+        gtf  = GTF,
+    output:
+        counts  = f"{RESULTS}/counts/all_samples_counts.txt",
+        summary = f"{RESULTS}/counts/all_samples_counts.txt.summary",
+    params:
+        strand   = config.get("strandedness", 2),  # 0=unstranded, 1=sense, 2=antisense
+        extra    = config.get("featurecounts_args",
+                   "-t exon -g gene_id -M --primary"),
+        paired   = "-p --countReadPairs" if PAIRED else ""
+    threads: THREADS_FC
+    conda:  "envs/rnaseq.yaml"
+    log:    "logs/featurecounts/featurecounts.log"
+    shell:
+        """
+        mkdir -p {RESULTS}/counts
+        featureCounts \
+            -T {threads} \
+            -a {input.gtf} \
+            -o {output.counts} \
+            {params.paired} \
+            -s {params.strand} \
+            {params.extra} \
+            {input.bams} \
+            &> {log}
+        """
+
+
+# ── Step 7: Count Matrix Formatting ──────────────────────────────────────────
+
+rule format_count_matrix:
+    """Extract and format the gene × sample count matrix for DESeq2."""
+    input:  f"{RESULTS}/counts/all_samples_counts.txt"
+    output: f"{RESULTS}/counts/count_matrix.csv"
+    run:
+        import pandas as pd
+        df = pd.read_csv(input[0], sep="\t", comment="#")
+        # Keep Geneid and count columns (skip chr, start, end, strand, length)
+        count_cols = [c for c in df.columns if "Aligned" in c]
+        # Clean column names: extract sample ID from path
+        clean_names = [Path(c).parent.parent.name for c in count_cols]
+        df_counts   = df[["Geneid"] + count_cols].copy()
+        df_counts.columns = ["gene_id"] + clean_names
+        df_counts.to_csv(output[0], index=False)
+        print(f"Count matrix: {df_counts.shape[0]} genes × {len(clean_names)} samples")
+
+
+# ── Step 8: MultiQC ───────────────────────────────────────────────────────────
+
+rule multiqc:
+    """Aggregate QC reports from all tools into a single HTML report."""
+    input:
+        expand(f"{RESULTS}/fastqc/{{sample}}_R1_fastqc.html",    sample=SAMPLES),
+        expand(f"{RESULTS}/star/{{sample}}/Log.final.out",         sample=SAMPLES),
+        f"{RESULTS}/counts/all_samples_counts.txt.summary",
+    output:
+        html = f"{RESULTS}/multiqc/multiqc_report.html",
+        data = directory(f"{RESULTS}/multiqc/multiqc_data"),
+    params:
+        outdir = f"{RESULTS}/multiqc",
+        indir  = RESULTS,
+    conda:  "envs/rnaseq.yaml"
+    log:    "logs/multiqc/multiqc.log"
+    shell:
+        """
+        multiqc \
+            {params.indir} \
+            --outdir {params.outdir} \
+            --filename multiqc_report.html \
+            --force \
+            &> {log}
+        """
